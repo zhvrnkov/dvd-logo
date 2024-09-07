@@ -20,8 +20,19 @@ typedef struct {
 } ObjectSoundEffects;
 
 typedef struct {
+    Texture2D texture;
+    Rectangle sourceTextureRect;
+} ObjectTextureDescriptor;
+
+typedef struct {
+    Color color;
+} ObjectColorDescriptor;
+
+typedef struct {
     ObjectDescriptor descriptor;
     ObjectSoundEffects sf;
+    ObjectTextureDescriptor tex;
+    ObjectColorDescriptor color;
 } Object;
 
 ObjectDescriptor MakeObjectDescriptor(float mass, Vector2 pos, Vector2 speed, Vector2 size, float stiffness)
@@ -39,7 +50,7 @@ ObjectSoundEffects MakeObjectSoundEffects(Sound sound)
 {
     ObjectSoundEffects sf;
     for (int i = 0; i < 4; i++) {
-        sf.sounds[0] = LoadSoundAlias(sound);
+        sf.sounds[i] = LoadSoundAlias(sound);
     }
     sf.soundIndex = 0;
     sf.didBounceX = 0;
@@ -67,7 +78,6 @@ void PlaySoundEffect(Object* object)
         }
         pitch = Clamp(pitch, 0.75, 2.0);
         volume = Clamp(volume, 0.1, 1.0);
-        printf("play %f %f\n", pitch, volume);
 
         SetSoundPitch(sound, pitch);
         SetSoundVolume(sound, volume);
@@ -81,20 +91,46 @@ typedef struct {
     Vector2 pos;
 } ObjectDrawDescriptor;
 
-ObjectDrawDescriptor MakeObjectDrawDescriptor(Object* object, float dt, Vector2 extAcceleration, float c) 
+void DrawDescriptor(ObjectDrawDescriptor* descriptor, ObjectTextureDescriptor* tex, ObjectColorDescriptor* colDesc)
+{
+    Vector2 pos = descriptor->pos;
+    Vector2 imsize = descriptor->size;
+    Vector2 origin = (Vector2) { pos.x, GetScreenHeight() - pos.y };
+    if (colDesc) {
+        DrawEllipse(origin.x, origin.y, imsize.x, imsize.y, colDesc->color);
+    }
+    if (tex) {
+        Vector2 texOrigin = Vector2Subtract(origin, (Vector2) { imsize.x, imsize.y });
+        Rectangle rect;
+        rect.x = texOrigin.x;
+        rect.y = texOrigin.y;
+        rect.width = imsize.x * 2.0;
+        rect.height = imsize.y * 2.0;
+        DrawTexturePro(tex->texture, tex->sourceTextureRect, rect, Vector2Zero(), 0.0, GetColor(0xFFFFFFFF));
+    }
+}
+
+ObjectDrawDescriptor MakeObjectDrawDescriptor(Object* object, float dt, Vector2 extAcceleration, Vector2 extForce, float c, float u) 
 {
     ObjectDrawDescriptor dd;
     Vector2 imsize = object->descriptor.size;
+    float area = PI * imsize.x * imsize.y;
     Vector2 npos = object->descriptor.pos;
     float k = object->descriptor.stiffness;
 
     Vector2 force = Vector2Scale(extAcceleration, object->descriptor.mass);
+    force = Vector2Add(force, extForce);
+    Vector2 fritionForce = Vector2Zero();
     float y = fminf(npos.y - imsize.y, 0.0) + fmaxf(npos.y + imsize.y - GetScreenHeight(), 0.0);
     if (fabsf(y) > 0) {
         object->sf.didBounceY += 1;
         float s = object->descriptor.speed.y;
-        force.y += -k * y - c * s;
+        float N = -k * y - c * s;
+        force.y += N;
         imsize.y -= fabsf(y);
+        imsize.x = area / (imsize.y * PI);
+        
+        fritionForce.x = -(object->descriptor.speed.x / fabsf(object->descriptor.speed.x)) * u * N;
     } else {
         object->sf.didBounceY = 0;
     }
@@ -103,11 +139,17 @@ ObjectDrawDescriptor MakeObjectDrawDescriptor(Object* object, float dt, Vector2 
     if (fabsf(x) > 0) {
         object->sf.didBounceX += 1;
         float s = object->descriptor.speed.x;
-        force.x += -k * x - c * s;
+        float N = -k * x - c * s;
+        force.x += N;
         imsize.x -= fabsf(x);
+        imsize.y = area / (imsize.x * PI);
+
+        fritionForce.y = (object->descriptor.speed.y / fabsf(object->descriptor.speed.y)) * u * N;
     } else {
         object->sf.didBounceX = 0;
     }
+    
+    force = Vector2Add(force, fritionForce);
     
     dd.pos = npos;
     dd.size = imsize;
@@ -126,12 +168,47 @@ ObjectDrawDescriptor MakeObjectDrawDescriptor(Object* object, float dt, Vector2 
 
     object->descriptor.pos = npos;
 
+    dd.pos = npos;
+    dd.size = imsize;
+
     return dd;
+}
+
+Vector3 cosv3(Vector3 x)
+{
+    return (Vector3) { cosf(x.x), cosf(x.y), cosf(x.z) };
+}
+
+Color pallete(float t)
+{
+    Vector3 a = { 0.5, 0.5, 0.5 };
+    Vector3 b = { 0.5, 0.5, 0.5 };
+    Vector3 c = { 1.0, 1.0, 1.0 };
+    Vector3 d = { 0.00, 0.10, 0.20 };
+    
+    Vector3 color = Vector3Add(a, Vector3Multiply(b, cosv3(Vector3Scale(Vector3Add(Vector3Scale(c, t), d), 6.28318f))));
+    
+    return ColorFromNormalized((Vector4) { color.x, color.y, color.z, 1.0 });
+}
+
+Vector2 gravity(const Object* from, const Object* to)
+{
+    const float G = 6.67 * 1e-4;
+    Vector2 force = Vector2Zero();
+
+    Vector2 center = (Vector2) { GetScreenWidth() / 2.0f, GetScreenHeight() / 2.0f };
+    Vector2 radiusVector = Vector2Subtract(from->descriptor.pos, to->descriptor.pos);
+    float radius = Vector2Length(radiusVector);
+    float centrificForce = G * from->descriptor.mass * to->descriptor.mass / (radius * radius);
+    radiusVector = Vector2Normalize(radiusVector);
+    return Vector2Scale(radiusVector, centrificForce);
 }
 
 int main()
 {
-    InitWindow(800, 600, "Playground");
+    SetConfigFlags(FLAG_MSAA_4X_HINT);
+
+    InitWindow(1200, 900, "Playground");
     InitAudioDevice();
 
     Sound bumpSound = LoadSound("./assets/sound_jump-90516.wav");
@@ -143,25 +220,38 @@ int main()
     sourceTextureRect.width = texture.width;
     sourceTextureRect.height = texture.height;
 
-    Rectangle destTextureRect;
-    destTextureRect.x = 0;
-    destTextureRect.y = 0;
-    destTextureRect.width = 128;
-    destTextureRect.height = 128;
-
     Object object = {
         .descriptor = MakeObjectDescriptor(
-            1e1,
-            (Vector2) { 512, 512 },
-            (Vector2) { 128, 0 },
-            (Vector2) { destTextureRect.width / 2, destTextureRect.height / 2 },
-            1e3),
-        .sf = MakeObjectSoundEffects(bumpSound)
+            1e9,
+            (Vector2) { GetScreenWidth() / 2.0 + 128, GetScreenHeight() / 2.0 },
+            (Vector2) { 0, 32 },
+            (Vector2) { 8, 8 },
+            1e12),
+        .sf = MakeObjectSoundEffects(bumpSound),
+        .tex = {
+            .sourceTextureRect = sourceTextureRect,
+            .texture = texture
+        }
+    };
+    
+    Object object2 = {
+        .descriptor = MakeObjectDescriptor(
+            2e9,
+            (Vector2) { GetScreenWidth() / 2.0 - 128, GetScreenHeight() / 2.0 },
+            (Vector2) { 0, -32 },
+            (Vector2) { 16, 16 },
+            1e12),
+        .sf = MakeObjectSoundEffects(bumpSound),
+        .tex = {
+            .sourceTextureRect = sourceTextureRect,
+            .texture = texture
+        }
     };
 
-
     float g = 9.8 * 256.0 / 10.0;
-    const float c = 5e0;
+    const float c = 1e10; // energy lose coef
+    const float u = 0.01; // friction coef
+    int itersCount = 1000;
 
     SetTargetFPS(60);
 
@@ -179,32 +269,46 @@ int main()
         windowAcceleration = Vector2Scale(windowAcceleration, 0.95);
         BeginDrawing();
         {
-            float dt = 1.0 / 60.0;
+            float t = GetTime();
+            float dt = 1.0 / 120.0;
             ClearBackground(GetColor(0));
 
             Vector2 extAcceleration = { 0, isDown ? -g : g };
+            extAcceleration = Vector2Zero();
             extAcceleration = Vector2Add(extAcceleration, windowAcceleration);
+
             if (IsKeyDown(KEY_UP))
                 isDown = false;
             if (IsKeyDown(KEY_DOWN))
                 isDown = true;
+            
+            if (IsKeyDown(KEY_RIGHT))
+                itersCount += 1;
 
-            ObjectDrawDescriptor drawDescriptor = MakeObjectDrawDescriptor(&object, dt, extAcceleration, c);
+            if (IsKeyDown(KEY_LEFT))
+                itersCount += 1;
+            
+            if (itersCount < 100)
+                itersCount = 100;
+            
+            ObjectDrawDescriptor drawDescriptors[2] = {0};
+            
+            for (int i = 0; i < itersCount / 100; i ++) {
+                Vector2 obj1_2_obj2 = gravity(&object, &object2);
+                Vector2 obj2_2_obj1 = gravity(&object2, &object);
+
+                drawDescriptors[0] = MakeObjectDrawDescriptor(&object, dt, extAcceleration, obj2_2_obj1, c, u);
+                object.color = (ObjectColorDescriptor) { pallete(0.6) };
+
+                drawDescriptors[1] = MakeObjectDrawDescriptor(&object2, dt, extAcceleration, obj1_2_obj2, c, u);
+                object2.color = (ObjectColorDescriptor) { pallete(0.1) };
+            }
+
             PlaySoundEffect(&object);
-draw: 
-        {
-            Vector2 pos = drawDescriptor.pos;
-            Vector2 imsize = drawDescriptor.size;
-            Vector2 origin = (Vector2) { pos.x, GetScreenHeight() - pos.y };
-            Vector2 texOrigin = Vector2Subtract(origin, (Vector2) { imsize.x, imsize.y });
-            Rectangle rect = destTextureRect;
-            rect.x = texOrigin.x;
-            rect.y = texOrigin.y;
-            rect.width = imsize.x * 2.0;
-            rect.height = imsize.y * 2.0;
-            DrawEllipse(origin.x, origin.y, imsize.x, imsize.y, GetColor(0xFFFFFFFF));
-            DrawTexturePro(texture, sourceTextureRect, rect, Vector2Zero(), 0.0, GetColor(0xFFFFFFFF));
-        }
+            PlaySoundEffect(&object2);
+
+            DrawDescriptor(&drawDescriptors[0], NULL, &object.color);
+            DrawDescriptor(&drawDescriptors[1], NULL, &object2.color);
         }
 
         EndDrawing();
